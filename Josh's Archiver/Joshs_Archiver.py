@@ -1,20 +1,20 @@
-import sys, os, shutil, tempfile, json, struct, zlib, hashlib, time, traceback, threading, subprocess
+import os, sys, json, time, shutil, tempfile, subprocess, traceback, threading, re, struct, zlib, hashlib
 from pathlib import Path
 from io import BytesIO
 
-# Try PyQt5 then PySide6
+# --- QT binding selection ---
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
     from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QSize
     from PyQt5.QtGui import QPixmap, QIcon
     from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QListWidgetItem, QFileIconProvider
-    QT_BINDING = "PyQt5"
+    QT = "PyQt5"
 except Exception:
     from PySide6 import QtCore, QtGui, QtWidgets
     from PySide6.QtCore import Qt, QThread, Signal, QSize
     from PySide6.QtGui import QPixmap, QIcon
     from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QListWidgetItem, QFileIconProvider
-    QT_BINDING = "PySide6"
+    QT = "PySide6"
 
 # Optional libs
 try:
@@ -42,12 +42,11 @@ if ON_WINDOWS:
     except Exception:
         winreg = None
 
-# Config / cache paths
+# --- config ---
 def cfg_path():
     if ON_WINDOWS:
         return Path(os.getenv("APPDATA") or Path.home()) / "miniarch_cfg.json"
     return Path.home() / ".miniarch_cfg.json"
-
 CFG_FILE = cfg_path()
 def load_cfg():
     try:
@@ -58,6 +57,7 @@ def load_cfg():
     return {}
 CFG = load_cfg()
 
+# thumbnail cache
 def thumb_cache_dir():
     if ON_WINDOWS:
         base = Path(os.getenv("APPDATA") or Path.home())
@@ -68,16 +68,34 @@ def thumb_cache_dir():
     return d
 THUMB_CACHE = thumb_cache_dir()
 
-# Embedded app icon (small PNG base64) - replace with your preferred image if you want
+# small embedded icon (tiny placeholder PNG base64) — replace with your PNG if you want
 APP_ICON_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKUlEQVR4nO3NMQEAAAjDMO5fN"
-    "Fh4gqYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABcC6kYAAEUgq1QAAAAAElFTkSuQmCC"
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKUlEQVR4nO3NMQEAAAjDMO5fNFh4gqYAAAAAAAAAAAAAAAAAAAAAAABcC6kYAAEUgq1QAAAAAElFTkSuQmCC"
 )
 
-# JARC simple format (header + compressed files + JSON manifest + footer)
+# --- helper utilities ---
+def safe_run(cmd, timeout=900, cwd=None):
+    # run external command without creating a new console window on Windows
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout, cwd=cwd, creationflags=creationflags)
+        return proc.returncode, proc.stdout.decode(errors="ignore"), proc.stderr.decode(errors="ignore")
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except Exception as e:
+        return -2, "", str(e)
+
+def save_cfg():
+    try:
+        CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CFG_FILE.write_text(json.dumps(CFG, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# --- jarc format helpers (minimal) ---
 JARC_MAGIC = b"JARC"
 JARC_FOOTER = b"JARCEOF"
-
 def create_jarc(out_path, inputs, compress=True):
     files = []
     for p in inputs:
@@ -94,7 +112,7 @@ def create_jarc(out_path, inputs, compress=True):
             files.append((str(pth), pth.name))
     with open(out_path, "wb") as f:
         f.write(JARC_MAGIC); f.write(b'\x01')
-        entries = []
+        entries=[]
         for full, arc in files:
             off = f.tell()
             with open(full, "rb") as rf:
@@ -104,7 +122,7 @@ def create_jarc(out_path, inputs, compress=True):
             else:
                 stored = data; compressed = False
             f.write(stored)
-            entries.append({"name": arc, "offset": off, "size": len(stored), "compressed": compressed})
+            entries.append({"name":arc, "offset":off, "size":len(stored), "compressed":compressed})
         manifest = json.dumps(entries, ensure_ascii=False).encode("utf-8")
         f.write(manifest)
         f.write(struct.pack("<Q", len(manifest)))
@@ -121,7 +139,7 @@ def read_jarc_manifest(path):
         manifest_len = struct.unpack("<Q", f.read(8))[0]
         footer = f.read(len(JARC_FOOTER))
         if footer != JARC_FOOTER:
-            raise RuntimeError("Missing JARC footer")
+            raise RuntimeError("Missing footer")
         start = fs - (len(JARC_FOOTER) + 8) - manifest_len
         f.seek(start)
         entries = json.loads(f.read(manifest_len).decode("utf-8"))
@@ -137,29 +155,17 @@ def extract_jarc_member_bytes(path, entry_name):
                 return zlib.decompress(b) if e.get("compressed") else b
     raise KeyError("entry not found")
 
-# Subprocess helper (no console windows on Windows)
-def safe_run(cmd, timeout=600, cwd=None):
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               check=False, timeout=timeout, cwd=cwd, creationflags=creationflags)
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired:
-        return -1, b"", b"timeout"
-    except Exception as e:
-        return -2, b"", str(e).encode()
-
-# Thumbs: worker uses QThread
+# --- Thumb worker (QThread) ---
 class ThumbWorker(QtCore.QObject):
-    thumb_ready = Signal(str, str)  # member_name, cache_path
+    thumb_ready = Signal(str, str)   # member, cache_path
     finished = Signal()
     log = Signal(str)
 
-    def __init__(self, archive_path, archive_fmt, names, password=None):
+    def __init__(self, archive_path, archive_fmt, members, password=None):
         super().__init__()
         self.archive_path = archive_path
         self.archive_fmt = archive_fmt
-        self.names = list(names)
+        self.members = list(members)
         self.password = password
         self._alive = True
 
@@ -168,48 +174,45 @@ class ThumbWorker(QtCore.QObject):
 
     def run(self):
         try:
-            for name in self.names:
+            for name in self.members:
                 if not self._alive: break
                 ext = Path(name).suffix.lower()
-                if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
+                if ext not in (".png",".jpg",".jpeg",".bmp",".gif",".webp",".tif",".tiff"): 
                     continue
                 key = hashlib.sha1((self.archive_path + '|' + name + str(Path(self.archive_path).stat().st_mtime)).encode()).hexdigest()
                 cache_file = THUMB_CACHE / (key + ".png")
                 if cache_file.exists():
-                    self.thumb_ready.emit(name, str(cache_file))
-                    continue
+                    self.thumb_ready.emit(name, str(cache_file)); continue
                 data = None
                 try:
                     if self.archive_fmt == "zip":
                         import zipfile
                         with zipfile.ZipFile(self.archive_path, "r") as zf:
-                            candidates = zf.namelist()
-                            cand = None
-                            for nm in candidates:
+                            candidate = None
+                            for nm in zf.namelist():
                                 if nm == name or Path(nm).name == Path(name).name:
-                                    cand = nm; break
-                            if cand:
+                                    candidate = nm; break
+                            if candidate:
                                 try:
-                                    data = zf.read(cand)
+                                    data = zf.read(candidate)
                                 except RuntimeError:
-                                    # encrypted zip, skip thumbnails (will prompt when opening)
                                     data = None
                     elif self.archive_fmt == "7z" and HAS_PY7ZR:
-                        tmpd = Path(tempfile.mkdtemp(prefix="thumb_"))
+                        tmpdir = Path(tempfile.mkdtemp(prefix="thumb_"))
                         try:
                             with py7zr.SevenZipFile(self.archive_path, 'r', password=(self.password if self.password else None)) as a:
                                 try:
-                                    a.extract(targets=[name], path=str(tmpd))
+                                    a.extract(targets=[name], path=str(tmpdir))
                                 except Exception:
-                                    a.extractall(path=str(tmpd))
-                                cand = tmpd / Path(name)
+                                    a.extractall(path=str(tmpdir))
+                                cand = tmpdir / Path(name)
                                 if cand.exists(): data = cand.read_bytes()
                                 else:
-                                    for p in tmpd.rglob("*"):
+                                    for p in tmpdir.rglob("*"):
                                         if p.is_file() and p.name == Path(name).name:
                                             data = p.read_bytes(); break
                         finally:
-                            shutil.rmtree(str(tmpd), ignore_errors=True)
+                            shutil.rmtree(str(tmpdir), ignore_errors=True)
                     elif self.archive_fmt == "rar" and HAS_RARFILE:
                         try:
                             with rarfile.RarFile(self.archive_path) as rf:
@@ -230,8 +233,7 @@ class ThumbWorker(QtCore.QObject):
                 except Exception as e:
                     self.log.emit(f"thumb extract error {name}: {e}")
                     data = None
-                if not data:
-                    continue
+                if not data: continue
                 try:
                     THUMB_CACHE.mkdir(parents=True, exist_ok=True)
                     if HAS_PIL:
@@ -242,27 +244,27 @@ class ThumbWorker(QtCore.QObject):
                         cache_file.write_bytes(data)
                     self.thumb_ready.emit(name, str(cache_file))
                 except Exception as e:
-                    self.log.emit(f"thumb save error {name}: {e}")
-                QtCore.QThread.msleep(30)
+                    self.log.emit("thumb save error "+str(e))
+                QtCore.QThread.msleep(20)
         except Exception as e:
-            self.log.emit("thumbworker crash: " + str(e) + "\n" + traceback.format_exc())
+            self.log.emit("thumbworker crashed: "+str(e)+"\n"+traceback.format_exc())
         finally:
             self.finished.emit()
 
-# Par2 manager
+# --- Par2 Manager ---
 class Par2Signals(QtCore.QObject):
     log = Signal(str)
-    progress = Signal(int, int)
+    progress = Signal(int,int)
     finished = Signal(object)
 
 class Par2Manager:
     """
-    Provides create and repair for par2 using an external par2 executable.
-    run_create(groups, redundancy, default_out_dir=None)
-       groups: list of tuples (files_list, base_name, out_dir)  (out_dir overrides default_out_dir)
+    Manages par2 create & repair. 
+    run_create(groups, redundancy, default_out_dir=None) where groups is list of (files_list, base_name, out_dir)
     run_repair_many(par2_files, move_repaired_to=None)
     """
-    def __init__(self, par2_exe=None, timeout=600):
+
+    def __init__(self, par2_exe=None, timeout=900):
         self.par2_exe = par2_exe or CFG.get("par2_exe") or shutil.which("par2") or shutil.which("par2.exe")
         self.timeout = timeout
         self.signals = Par2Signals()
@@ -273,159 +275,183 @@ class Par2Manager:
         return bool(self.par2_exe and Path(self.par2_exe).exists())
 
     def _log(self, s):
-        try: self.signals.log.emit(s)
-        except Exception: pass
-
-    def _append_logfile(self, text):
         try:
-            path = Path(os.getenv("APPDATA") or Path.home()) / "miniarch_par2.log"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(path.read_text(encoding="utf-8", errors="ignore") + "\n" + text, encoding="utf-8", errors="ignore")
+            self.signals.log.emit(s)
         except Exception:
             pass
 
-    def _try_par2_cmds(self, cmd_base, cwd):
-        # run and return rc,out,err (decoded)
-        rc, outb, errb = safe_run(cmd_base, timeout=self.timeout, cwd=cwd)
-        out = outb.decode(errors="ignore") if isinstance(outb, (bytes,bytearray)) else str(outb)
-        err = errb.decode(errors="ignore") if isinstance(errb, (bytes,bytearray)) else str(errb)
+    def _try_run(self, cmd, cwd):
+        rc, out, err = safe_run(cmd, timeout=self.timeout, cwd=cwd)
         return rc, out, err
 
     def _create_single(self, files, redundancy, base_name=None, out_dir=None):
         res = {"files": files, "created": [], "rc": None, "out": "", "err": "", "error": None}
         try:
+            # Filter out any .par2 files from the candidate set
+            files = [f for f in files if not str(f).lower().endswith(".par2")]
+            files = [f for f in files if Path(f).exists()]
             if not files:
-                res["error"]="no files"; return res
-            first = Path(files[0])
-            workdir = Path(out_dir) if out_dir else first.parent
+                res["error"] = "No non-par2 files to protect"
+                return res
+            workdir = Path(out_dir) if out_dir else Path(files[0]).parent
+            workdir.mkdir(parents=True, exist_ok=True)
             if base_name:
-                base_path = workdir / (base_name + ".par2")
+                par2_path = Path(out_dir if out_dir else workdir) / (base_name + ".par2")
             else:
-                base_path = workdir / (first.stem + ".par2")
-            # build command (par2 create)
-            cmd = [self.par2_exe, "create", f"-r{redundancy}", str(base_path)] + files
-            self._log("par2: Running: " + " ".join(cmd) + f" (cwd={workdir})")
-            rc, out, err = self._try_par2_cmds(cmd, cwd=str(workdir))
-            res["rc"]=rc; res["out"]=out; res["err"]=err
-            # detect created par2s by stem
-            stem = base_path.stem
-            created=[]
-            for p in workdir.iterdir():
-                if p.is_file() and p.suffix.lower()==".par2" and p.stem.startswith(stem):
-                    created.append(str(p))
-            res["created"]=created
-            if rc!=0 and not created:
-                res["error"]=f"par2 returned rc={rc}"
+                par2_path = Path(workdir) / (Path(files[0]).stem + ".par2")
+            # Build command: par2 create -r{redundancy} par2_path file1 file2 ...
+            cmd = [self.par2_exe, "create", f"-r{redundancy}", str(par2_path)] + files
+            self._log(f"par2: Running: {' '.join(cmd)} (cwd={workdir})")
+            rc, out, err = self._try_run(cmd, cwd=str(workdir))
+            res["rc"] = rc; res["out"] = out; res["err"] = err
+            # pick up created par2s with same stem
+            stem = par2_path.stem
+            created = []
+            for f in workdir.iterdir():
+                if f.is_file() and f.suffix.lower() == ".par2" and f.stem.startswith(stem):
+                    created.append(str(f))
+            res["created"] = created
+            if rc != 0 and not created:
+                res["error"] = f"par2 returned rc={rc}"
             return res
         except Exception as e:
-            res["error"]=str(e); self._log("par2 create exception: " + str(e)); self._append_logfile(traceback.format_exc()); return res
+            res["error"] = str(e)
+            self._log("par2 create error: "+str(e))
+            return res
 
     def run_create(self, groups, redundancy=10, default_out_dir=None):
         if self._thread and self._thread.is_alive():
-            self._log("par2: already running"); return
-        def work():
-            total=len(groups); summary=[]
+            self._log("par2: already running create")
+            return
+        def worker():
+            total = len(groups)
+            summary=[]
             for idx, grp in enumerate(groups, start=1):
                 if self._stop: break
                 files, base_name, out_dir = grp
                 out_dir = out_dir or default_out_dir
+                # Expand folders to file-lists (but exclude .par2)
+                expanded=[]
+                for f in files:
+                    p = Path(f)
+                    if not p.exists(): continue
+                    if p.is_dir():
+                        for root, _, names in os.walk(str(p)):
+                            for n in names:
+                                fn = Path(root) / n
+                                if not fn.name.lower().endswith(".par2"):
+                                    expanded.append(str(fn))
+                    else:
+                        if not p.name.lower().endswith(".par2"):
+                            expanded.append(str(p))
+                files = expanded
                 self.signals.progress.emit(idx, total)
                 self._log(f"par2: Creating par2 for group {idx}/{total} files={len(files)} base={base_name} out_dir={out_dir}")
                 r = self._create_single(files, redundancy, base_name=base_name, out_dir=out_dir)
                 summary.append(r)
             self.signals.finished.emit(summary)
-        self._thread = threading.Thread(target=work, daemon=True); self._thread.start()
+        self._thread = threading.Thread(target=worker, daemon=True); self._thread.start()
 
-    def _canonical_base(self, filename):
-        name = Path(filename).stem
-        name = re.sub(r'\.vol\d+\+\d+(?:_\d+)?$', '', name, flags=re.IGNORECASE)
-        name = re.sub(r'_\d+$','', name)
-        return name
+    def _pick_main_par2(self, par2_files):
+        # choose first file that does not contain '+' or 'vol' in name (heuristic)
+        for f in par2_files:
+            name = Path(f).name.lower()
+            if "+" not in name and "vol" not in name:
+                return f
+        # else return the longest/first
+        return par2_files[0] if par2_files else None
 
-    def _repair_single(self, par2file, move_repaired_to=None):
-        res = {"par2": par2file, "rc": None, "out":"", "err":"", "moved":[], "error": None}
+    def _repair_single(self, main_par2, move_repaired_to=None):
+        res = {"par2": main_par2, "rc": None, "out":"", "err":"", "moved":[], "error": None}
         try:
-            pp = Path(par2file)
-            if not pp.exists():
-                res["error"]="par2 file missing"; return res
-            workdir = str(pp.parent)
-            self._log(f"par2: Repairing {par2file}")
-            cmd = [self.par2_exe, "repair", par2file]
-            rc, out, err = self._try_par2_cmds(cmd, cwd=workdir)
-            res["rc"]=rc; res["out"]=out; res["err"]=err
-            # detect files that changed after repair (use mtime)
+            p = Path(main_par2)
+            if not p.exists():
+                res["error"] = "par2 missing"; return res
+            workdir = str(p.parent)
+            # snapshot existing file mtimes (excluding .par2 files)
             before = {}
             for f in Path(workdir).iterdir():
                 if f.is_file() and f.suffix.lower() != ".par2":
-                    before[str(f)] = f.stat().st_mtime
-            # allow par2 to finish then re-check
-            time.sleep(0.3)
-            after_changed=[]
+                    try: before[str(f)] = f.stat().st_mtime
+                    except Exception: before[str(f)] = 0
+            cmd = [self.par2_exe, "repair", str(p)]
+            self._log("par2: Running repair: " + " ".join(cmd) + f" (cwd={workdir})")
+            rc, out, err = self._try_run(cmd, cwd=workdir)
+            res["rc"] = rc; res["out"] = out; res["err"] = err
+            # small wait; re-scan to find files with newer mtime
+            time.sleep(0.2)
+            moved = []
+            changed_files = []
             for f in Path(workdir).iterdir():
                 if f.is_file() and f.suffix.lower() != ".par2":
                     old = before.get(str(f), 0)
                     try:
-                        mtime = f.stat().st_mtime
-                        if mtime > old + 0.0001:
-                            after_changed.append(f)
+                        if f.stat().st_mtime > old + 0.0001:
+                            changed_files.append(str(f))
                     except Exception:
                         pass
-            moved=[]
-            if move_repaired_to and after_changed:
+            # if move_repaired_to provided, move changed files
+            if move_repaired_to and changed_files:
                 dest = Path(move_repaired_to); dest.mkdir(parents=True, exist_ok=True)
-                for f in after_changed:
+                for cf in changed_files:
                     try:
-                        dst = dest / f.name
+                        src = Path(cf)
+                        dst = dest / src.name
                         if dst.exists():
-                            dst = dest / (f.stem + f"_{int(time.time())}" + f.suffix)
-                        shutil.move(str(f), str(dst)); moved.append(str(dst))
+                            dst = dest / (src.stem + f"_{int(time.time())}" + src.suffix)
+                        shutil.move(str(src), str(dst))
+                        moved.append(str(dst))
                     except Exception:
                         try:
-                            shutil.copy2(str(f), str(dest / f.name)); moved.append(str(dest / f.name))
+                            shutil.copy2(str(src), str(dest / Path(src).name))
+                            moved.append(str(dest / Path(src).name))
                         except Exception as e:
-                            self._log("Failed to move repaired file: "+str(e))
-            res["moved"]=moved
+                            self._log("Failed to move repaired file: " + str(e))
+            res["moved"] = moved
             return res
         except Exception as e:
-            res["error"]=str(e); self._log("par2 repair exception: "+str(e)); self._append_logfile(traceback.format_exc()); return res
+            res["error"] = str(e)
+            self._log("par2 repair error: "+str(e)+"\n"+traceback.format_exc())
+            return res
 
     def run_repair_many(self, par2_files, move_repaired_to=None):
         if self._thread and self._thread.is_alive():
-            self._log("par2: repair already running"); return
-        # group par2s by base in same folder (simple heuristic)
-        groups = {}
+            self._log("par2: repair already running")
+            return
+        # Group by directory and base (simple heuristic)
+        grouped = {}
         for p in par2_files:
-            pp = Path(p); base = pp.stem
-            key = (str(pp.parent), base)
-            groups.setdefault(key, []).append(str(pp))
-        reps = []
-        for (dirpath, base), files in groups.items():
-            reps.append((files[0], files))
-        def work():
-            total = len(reps)
+            pp = Path(p)
+            key = str(pp.parent)
+            grouped.setdefault(key, []).append(str(pp))
+        def worker():
+            total = len(grouped)
             summary=[]
-            for idx, (rep, files) in enumerate(reps, start=1):
+            for idx, (dirpath, files) in enumerate(grouped.items(), start=1):
                 if self._stop: break
                 self.signals.progress.emit(idx, total)
-                r = self._repair_single(rep, move_repaired_to=move_repaired_to)
-                r["group_members"]=files
+                main = self._pick_main_par2(files)
+                if not main:
+                    self._log("par2: no main par2 found for group in " + dirpath)
+                    continue
+                self._log(f"par2: Repairing {main} in {dirpath}")
+                r = self._repair_single(main, move_repaired_to=move_repaired_to)
+                r["group"] = files
                 summary.append(r)
             self.signals.finished.emit(summary)
-        self._thread = threading.Thread(target=work, daemon=True); self._thread.start()
+        self._thread = threading.Thread(target=worker, daemon=True); self._thread.start()
 
     def stop(self):
         self._stop = True
 
-# GUI
-import re
-
+# --- GUI Window ---
 class MiniArchWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MiniArch")
-        self.resize(1200,800)
+        self.setWindowTitle("MiniArch - fixed")
+        self.resize(1100,780)
         self._install_icon()
-        self._setup_ui()
+        self._build_ui()
         self.current_archive = None
         self.current_format = None
         self.pwd_cache = {}
@@ -434,20 +460,19 @@ class MiniArchWindow(QMainWindow):
         self.thumb_thread = None
         self.thumb_worker = None
         self.par2mgr = Par2Manager(par2_exe=CFG.get("par2_exe"))
-
-        self._log(f"Init: QT={QT_BINDING}, py7zr={HAS_PY7ZR}, pyzipper={HAS_PYZIPPER}, rarfile={HAS_RARFILE}, pillow={HAS_PIL}")
-        self.statusBar().showMessage(f"par2: {CFG.get('par2_exe') or self.par2mgr.par2_exe or 'not found'}")
+        self._log(f"Init: QT={QT}, py7zr={HAS_PY7ZR}, pyzipper={HAS_PYZIPPER}, rarfile={HAS_RARFILE}, pillow={HAS_PIL}")
+        self.statusBar().showMessage(f"par2: {self.par2mgr.par2_exe or 'not found'}")
 
     def _install_icon(self):
         try:
-            data = BytesIO(__import__('base64').b64decode(APP_ICON_BASE64))
-            pm = QPixmap(); pm.loadFromData(data.read())
-            if not pm.isNull():
-                self.setWindowIcon(QIcon(pm))
+            import base64
+            data = base64.b64decode(APP_ICON_BASE64)
+            pm = QPixmap(); pm.loadFromData(data)
+            if not pm.isNull(): self.setWindowIcon(QIcon(pm))
         except Exception:
             pass
 
-    def _setup_ui(self):
+    def _build_ui(self):
         w = QtWidgets.QWidget(); self.setCentralWidget(w)
         v = QtWidgets.QVBoxLayout(w)
 
@@ -456,10 +481,9 @@ class MiniArchWindow(QMainWindow):
         self.btn_back = QtWidgets.QPushButton("Back"); self.btn_back.clicked.connect(self.go_back); self.btn_back.setEnabled(False); top.addWidget(self.btn_back)
         top.addStretch()
         self.btn_clear_thumbs = QtWidgets.QPushButton("Clear thumbnail cache"); self.btn_clear_thumbs.clicked.connect(self.clear_thumb_cache); top.addWidget(self.btn_clear_thumbs)
-        self.btn_associate = QtWidgets.QPushButton("Associate .jarc with this script"); self.btn_associate.clicked.connect(self.associate_jarc); top.addWidget(self.btn_associate)
-        self.btn_locate_par2 = QtWidgets.QPushButton("Locate par2"); self.btn_locate_par2.clicked.connect(self.locate_par2); top.addWidget(self.btn_locate_par2)
-        self.btn_search_par2 = QtWidgets.QPushButton("Search par2"); self.btn_search_par2.clicked.connect(self.search_par2); top.addWidget(self.btn_search_par2)
-        self.btn_install_par2 = QtWidgets.QPushButton("Install par2 via Chocolatey"); self.btn_install_par2.clicked.connect(self.install_par2_choco); top.addWidget(self.btn_install_par2)
+        self.btn_loc = QtWidgets.QPushButton("Locate par2"); self.btn_loc.clicked.connect(self.locate_par2); top.addWidget(self.btn_loc)
+        self.btn_search = QtWidgets.QPushButton("Search par2"); self.btn_search.clicked.connect(self.search_par2); top.addWidget(self.btn_search)
+        self.btn_install = QtWidgets.QPushButton("Install par2 via Chocolatey"); self.btn_install.clicked.connect(self.install_par2_choco); top.addWidget(self.btn_install)
 
         split = QtWidgets.QSplitter(); v.addWidget(split, 1)
         left = QtWidgets.QWidget(); left_l = QtWidgets.QVBoxLayout(left); split.addWidget(left)
@@ -475,7 +499,7 @@ class MiniArchWindow(QMainWindow):
 
         right_l.addWidget(QtWidgets.QLabel("Create / Stage"))
         self.combo_fmt = QtWidgets.QComboBox(); self.combo_fmt.addItems(["zip","7z","jarc","rar"]); right_l.addWidget(self.combo_fmt)
-        self.input_pwd = QtWidgets.QLineEdit(); self.input_pwd.setEchoMode(QtWidgets.QLineEdit.Password); self.input_pwd.setPlaceholderText("Password (blank=none)"); right_l.addWidget(self.input_pwd)
+        self.input_pwd = QtWidgets.QLineEdit(); self.input_pwd.setEchoMode(QtWidgets.QLineEdit.Password); self.input_pwd.setPlaceholderText("Password (blank = none)"); right_l.addWidget(self.input_pwd)
         h = QtWidgets.QHBoxLayout(); right_l.addLayout(h)
         self.chk_par2_auto = QtWidgets.QCheckBox("Also create .par2 after archive"); h.addWidget(self.chk_par2_auto)
         h.addWidget(QtWidgets.QLabel("Redundancy %"))
@@ -487,7 +511,7 @@ class MiniArchWindow(QMainWindow):
         row = QtWidgets.QHBoxLayout(); right_l.addLayout(row)
         self.btn_create = QtWidgets.QPushButton("Create Archive"); self.btn_create.clicked.connect(self.create_archive); row.addWidget(self.btn_create)
         self.btn_create_rar = QtWidgets.QPushButton("Create RAR (rar.exe)"); self.btn_create_rar.clicked.connect(self.create_rar); row.addWidget(self.btn_create_rar)
-        if not shutil.which("rar") and not shutil.which("rar.exe"):
+        if not (shutil.which("rar") or shutil.which("rar.exe")):
             self.btn_create_rar.setEnabled(False)
 
         right_l.addWidget(QtWidgets.QLabel("Par2 Targets (files/folders):"))
@@ -508,28 +532,27 @@ class MiniArchWindow(QMainWindow):
         self.btn_load_par2 = QtWidgets.QPushButton("Load .par2 Files"); self.btn_load_par2.clicked.connect(self.load_par2); rrow.addWidget(self.btn_load_par2)
         self.btn_repair_selected = QtWidgets.QPushButton("Repair & Move Selected"); self.btn_repair_selected.clicked.connect(self.repair_selected); rrow.addWidget(self.btn_repair_selected)
         self.btn_repair_all = QtWidgets.QPushButton("Repair & Move All"); self.btn_repair_all.clicked.connect(self.repair_all); rrow.addWidget(self.btn_repair_all)
-        # disabled until files loaded
         self.btn_repair_selected.setEnabled(False); self.btn_repair_all.setEnabled(False)
 
         self.progress = QtWidgets.QProgressBar(); v.addWidget(self.progress)
 
-    # ---------- logging ----------
+    # --- logging ---
     def _log(self, s):
-        t = time.strftime("%Y-%m-%d %H:%M:%S")
-        ln = f"{t} {s}"
         try:
+            t = time.strftime("%Y-%m-%d %H:%M:%S")
+            ln = f"{t} {s}"
             self.log_text.append(ln)
         except Exception:
             pass
-        print(ln, flush=True)
+        print(s, flush=True)
 
-    # ---------- archive open/list ----------
+    # --- archive load / list ---
     def open_archive(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open archive", filter="Archives (*.zip *.7z *.rar *.jarc);;All files (*)")
         if not fn: return
         ext = Path(fn).suffix.lower().lstrip('.')
         if ext not in ("zip","7z","rar","jarc"):
-            QMessageBox.warning(self, "Unsupported", "Supported: zip, 7z, rar, jarc"); return
+            QMessageBox.warning(self, "Unsupported", "Supported: zip,7z,rar,jarc"); return
         if self.current_archive:
             self.archive_stack.append((self.current_archive, self.current_format))
             self.btn_back.setEnabled(True)
@@ -552,14 +575,13 @@ class MiniArchWindow(QMainWindow):
             if fmt == "zip":
                 import zipfile
                 with zipfile.ZipFile(path, 'r') as zf:
-                    # detect encryption bits
-                    needs_pwd = False
+                    need_pwd=False
                     for zi in zf.infolist():
                         if getattr(zi, "flag_bits", 0) & 0x1:
-                            needs_pwd=True; break
-                    if needs_pwd and not pwd:
-                        p = self.ask_password(f"ZIP {Path(path).name} appears encrypted. Enter password:")
-                        if not p: QMessageBox.information(self, "Password", "Won't list without password"); return
+                            need_pwd=True; break
+                    if need_pwd and not pwd:
+                        p = self._ask_password("ZIP seems encrypted; enter password to list")
+                        if not p: QMessageBox.information(self, "Password", "Won't list"); return
                         self.pwd_cache[path]=p; pwd=p
                     members = zf.namelist()
             elif fmt == "7z":
@@ -568,8 +590,8 @@ class MiniArchWindow(QMainWindow):
                     with py7zr.SevenZipFile(path, 'r', password=(pwd if pwd else None)) as a:
                         members = a.getnames()
                 except Exception:
-                    p = self.ask_password(f"7z {Path(path).name} needs a password")
-                    if not p: QMessageBox.information(self, "Password", "Won't list without password"); return
+                    p = self._ask_password("7z requires password")
+                    if not p: QMessageBox.information(self, "Password", "Won't list"); return
                     self.pwd_cache[path]=p; pwd=p
                     with py7zr.SevenZipFile(path, 'r', password=p) as a:
                         members = a.getnames()
@@ -579,39 +601,35 @@ class MiniArchWindow(QMainWindow):
                     with rarfile.RarFile(path) as rf:
                         members = rf.namelist()
                 except rarfile.NeedPassword:
-                    p = self.ask_password(f"RAR {Path(path).name} needs a password")
-                    if not p: QMessageBox.information(self, "Password", "Won't list without password"); return
+                    p = self._ask_password("RAR needs password")
+                    if not p: QMessageBox.information(self, "Password", "Won't list"); return
                     self.pwd_cache[path]=p; pwd=p
                     with rarfile.RarFile(path) as rf:
                         members = rf.namelist()
                 except Exception:
-                    p = self.ask_password(f"RAR {Path(path).name} may require a password")
-                    if not p: QMessageBox.information(self, "Password", "Won't list without password"); return
+                    p = self._ask_password("RAR may require password")
+                    if not p: QMessageBox.information(self, "Password", "Won't list"); return
                     self.pwd_cache[path]=p; pwd=p
                     with rarfile.RarFile(path) as rf:
                         members = rf.namelist()
             elif fmt == "jarc":
-                try:
-                    entries = read_jarc_manifest(path)
-                    members = [e["name"] for e in entries]
-                except Exception as e:
-                    QMessageBox.critical(self, "JARC", f"Bad JARC: {e}"); return
+                entries = read_jarc_manifest(path)
+                members = [e["name"] for e in entries]
         except Exception as e:
             self._log("list error: " + str(e) + "\n" + traceback.format_exc())
             QMessageBox.critical(self, "List error", str(e)); return
 
         image_members=[]
         for m in members:
-            item = QListWidgetItem(m)
+            it = QListWidgetItem(m)
             if m.endswith('/') or m.endswith('\\'):
-                item.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+                it.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
             else:
                 ext = Path(m).suffix.lower()
                 if ext in (".png",".jpg",".jpeg",".bmp",".gif",".webp",".tif",".tiff"):
-                    item.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+                    it.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
                     image_members.append(m)
                 else:
-                    # system icon probe
                     try:
                         provider = QFileIconProvider()
                         dummy = Path(THUMB_CACHE) / ("dummy" + (ext or ".txt"))
@@ -619,24 +637,24 @@ class MiniArchWindow(QMainWindow):
                             dummy.write_bytes(b"")
                         qfi = QtCore.QFileInfo(str(dummy))
                         icon = provider.icon(qfi)
-                        item.setIcon(icon)
+                        it.setIcon(icon)
                     except Exception:
-                        item.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
-            self.list_contents.addItem(item)
+                        it.setIcon(QApplication.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+            self.list_contents.addItem(it)
         if image_members:
             self._start_thumb_worker(image_members)
 
-    def ask_password(self, prompt):
+    def _ask_password(self, prompt):
         text, ok = QtWidgets.QInputDialog.getText(self, "Password", prompt, QtWidgets.QLineEdit.Password)
-        if ok and text: return text
+        if ok and text:
+            return text
         return None
 
-    # ---------- thumbnails ----------
+    # thumbnail worker management
     def _start_thumb_worker(self, names):
         try:
             if self.thumb_worker and self.thumb_thread:
-                self.thumb_worker.stop()
-                self.thumb_thread.quit(); self.thumb_thread.wait(200)
+                self.thumb_worker.stop(); self.thumb_thread.quit(); self.thumb_thread.wait(200)
         except Exception:
             pass
         self.thumb_worker = ThumbWorker(self.current_archive, self.current_format, names, password=self.pwd_cache.get(self.current_archive))
@@ -644,14 +662,14 @@ class MiniArchWindow(QMainWindow):
         self.thumb_worker.moveToThread(self.thumb_thread)
         self.thumb_thread.started.connect(self.thumb_worker.run)
         self.thumb_worker.thumb_ready.connect(self._on_thumb_ready)
-        self.thumb_worker.log.connect(lambda s: self._log("thumb: " + s))
+        self.thumb_worker.log.connect(lambda s: self._log("thumb: "+s))
         self.thumb_worker.finished.connect(self._on_thumb_finished)
         self.thumb_thread.start()
 
     def _on_thumb_ready(self, member, cache_path):
         for i in range(self.list_contents.count()):
             it = self.list_contents.item(i)
-            if it.text()==member:
+            if it.text() == member:
                 try:
                     pm = QPixmap(cache_path)
                     if not pm.isNull():
@@ -675,7 +693,7 @@ class MiniArchWindow(QMainWindow):
                 except Exception: pass
         self._log(f"Cleared {removed} thumbnails")
 
-    # ---------- open / extract members (nested) ----------
+    # --- open/extract nested members ---
     def item_double(self, item):
         member = item.text()
         ext = Path(member).suffix.lower().lstrip('.')
@@ -695,15 +713,12 @@ class MiniArchWindow(QMainWindow):
             if got and got.exists():
                 self._open_with_system(got)
             else:
-                # try search for file by name in temp dir
                 found=None
                 for p in tmpd.rglob("*"):
-                    if p.is_file() and p.name==Path(member).name:
+                    if p.is_file() and p.name == Path(member).name:
                         found=p; break
-                if found:
-                    self._open_with_system(found)
-                else:
-                    QMessageBox.warning(self, "Open", "Could not extract/open member")
+                if found: self._open_with_system(found)
+                else: QMessageBox.warning(self, "Open", "Could not extract/open member")
 
     def _open_with_system(self, p: Path):
         try:
@@ -713,20 +728,17 @@ class MiniArchWindow(QMainWindow):
                 subprocess.run(["xdg-open", str(p)], check=False)
         except Exception as e:
             self._log("open error: "+str(e))
-            QMessageBox.warning(self, "Open", f"Failed to open: {e}")
 
     def _extract_member_to_temp(self, member, tmpdir: Path):
-        if not self.current_archive:
-            return None
+        if not self.current_archive: return None
         fmt = self.current_format; path = self.current_archive; pwd = self.pwd_cache.get(path)
         try:
             if fmt=="zip":
                 import zipfile
-                with zipfile.ZipFile(path,"r") as zf:
-                    names = zf.namelist()
+                with zipfile.ZipFile(path, "r") as zf:
                     cand=None
-                    for nm in names:
-                        if nm==member or Path(nm).name==Path(member).name:
+                    for nm in zf.namelist():
+                        if nm==member or Path(nm).name == Path(member).name:
                             cand=nm; break
                     if not cand: return None
                     try:
@@ -736,11 +748,9 @@ class MiniArchWindow(QMainWindow):
                             zf.extract(cand, path=str(tmpdir))
                         return tmpdir / cand
                     except RuntimeError:
-                        p = self.ask_password("ZIP needs password:")
+                        p = self._ask_password("ZIP needs password")
                         if not p: return None
-                        self.pwd_cache[path]=p
-                        zf.extract(cand, path=str(tmpdir), pwd=p.encode())
-                        return tmpdir / cand
+                        self.pwd_cache[path]=p; zf.extract(cand, path=str(tmpdir), pwd=p.encode()); return tmpdir / cand
             elif fmt=="7z":
                 if not HAS_PY7ZR: raise RuntimeError("py7zr required")
                 try:
@@ -752,7 +762,7 @@ class MiniArchWindow(QMainWindow):
                         if not target: return None
                         a.extract(targets=[target], path=str(tmpdir)); return tmpdir / target
                 except Exception:
-                    p = self.ask_password("7z needs password:")
+                    p = self._ask_password("7z needs password")
                     if not p: return None
                     self.pwd_cache[path]=p
                     with py7zr.SevenZipFile(path, 'r', password=p) as a:
@@ -764,18 +774,19 @@ class MiniArchWindow(QMainWindow):
             elif fmt=="rar":
                 if not HAS_RARFILE: raise RuntimeError("rarfile required")
                 with rarfile.RarFile(path) as rf:
-                    names=rf.namelist(); target=None
-                    for n in names:
-                        if n==member or Path(n).name==Path(member).name: target=n; break
+                    target=None
+                    for n in rf.namelist():
+                        if n==member or Path(n).name==Path(member).name:
+                            target=n; break
                     if not target: return None
                     try:
                         rf.extract(target, path=str(tmpdir), pwd=(pwd if pwd else None))
                     except rarfile.BadRarFile:
-                        p = self.ask_password("RAR needs password:")
+                        p = self._ask_password("RAR needs password")
                         if not p: return None
                         self.pwd_cache[path]=p; rf.extract(target, path=str(tmpdir), pwd=p)
                     except Exception:
-                        p = self.ask_password("RAR may require password:")
+                        p = self._ask_password("RAR may require password")
                         if not p: return None
                         self.pwd_cache[path]=p; rf.extract(target, path=str(tmpdir), pwd=p)
                     return tmpdir / target
@@ -785,30 +796,29 @@ class MiniArchWindow(QMainWindow):
             self._log("extract member error: "+str(e)+"\n"+traceback.format_exc())
             return None
 
-    # ---------- stage/create ----------
+    # --- stage/create ---
     def stage_add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select files")
-        for f in files:
-            self.list_stage.addItem(f)
+        for f in files: self.list_stage.addItem(f)
 
     def stage_add_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Select folder")
         if d: self.list_stage.addItem(d)
 
     def create_archive(self):
-        if self.list_stage.count()==0:
+        if self.list_stage.count() == 0:
             QMessageBox.information(self, "No files", "Stage files/folders first"); return
         fmt = self.combo_fmt.currentText()
         out, _ = QFileDialog.getSaveFileName(self, "Save archive as", filter=f"{fmt.upper()} (*.{fmt})")
         if not out: return
         if not out.lower().endswith("." + fmt): out += "." + fmt
-        items=[self.list_stage.item(i).text() for i in range(self.list_stage.count())]
+        items = [self.list_stage.item(i).text() for i in range(self.list_stage.count())]
         pwd = self.input_pwd.text().strip()
         try:
             if fmt=="zip":
                 import zipfile
                 if pwd and not HAS_PYZIPPER:
-                    QMessageBox.critical(self, "Missing pyzipper", "pyzipper is required for passworded zip (pip install pyzipper)"); return
+                    QMessageBox.critical(self, "Missing pyzipper", "pyzipper required for passworded zip."); return
                 if pwd:
                     with pyzipper.AESZipFile(out, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
                         zf.setpassword(pwd.encode())
@@ -816,7 +826,7 @@ class MiniArchWindow(QMainWindow):
                             pth = Path(p)
                             if pth.is_dir():
                                 parent = pth.parent
-                                for root, _, names in os.walk(p):
+                                for root, _, names in os.walk(pth):
                                     for n in names:
                                         full = Path(root)/n; arc = str(full.relative_to(parent)).replace("\\","/")
                                         zf.write(str(full), arcname=arc)
@@ -828,14 +838,15 @@ class MiniArchWindow(QMainWindow):
                             pth = Path(p)
                             if pth.is_dir():
                                 parent = pth.parent
-                                for root, _, names in os.walk(p):
+                                for root, _, names in os.walk(pth):
                                     for n in names:
-                                        full=Path(root)/n; arc = str(full.relative_to(parent)).replace("\\","/")
+                                        full = Path(root)/n; arc = str(full.relative_to(parent)).replace("\\","/")
                                         zf.write(str(full), arcname=arc)
                             else:
                                 zf.write(str(pth), arcname=pth.name)
             elif fmt=="7z":
-                if not HAS_PY7ZR: QMessageBox.critical(self, "Missing py7zr", "py7zr required"); return
+                if not HAS_PY7ZR:
+                    QMessageBox.critical(self, "Missing py7zr", "py7zr required"); return
                 if pwd:
                     with py7zr.SevenZipFile(out, 'w', password=pwd) as a:
                         for p in items:
@@ -857,31 +868,31 @@ class MiniArchWindow(QMainWindow):
                 cmd = [rarexe, "a", "-ep1", out] + items
                 if pwd: cmd.insert(2, f"-hp{pwd}")
                 rc, outb, errb = safe_run(cmd, timeout=600)
-                if rc!=0:
+                if rc != 0:
                     QMessageBox.warning(self, "RAR create", f"rar returned rc={rc}")
             self._log("Created " + out)
             QMessageBox.information(self, "Created", f"Archive created: {out}")
+            # If auto par2 requested, create for the created archive
             if self.chk_par2_auto.isChecked():
-                par2_red = int(self.spin_red.value()); mgr = Par2Manager(par2_exe=CFG.get("par2_exe"))
+                mgr = Par2Manager(par2_exe=CFG.get("par2_exe"))
                 if not mgr.is_ok():
-                    QMessageBox.information(self, "par2 missing", "par2 not configured. Use Locate/Search/Install")
+                    QMessageBox.information(self, "par2 missing", "par2 not configured.")
                 else:
-                    groups = [([out], None, None)]
+                    # groups: single group with created archive only
+                    groups = [([out], Path(out).stem, str(Path(out).parent))]
                     mgr.signals.log.connect(lambda s: self._log("par2: "+s))
                     mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
                     mgr.signals.finished.connect(lambda summary: (self._log("par2 create finished"), self.progress.setValue(0)))
-                    mgr.run_create(groups, par2_red, default_out_dir=None)
+                    mgr.run_create(groups, redundancy=int(self.spin_red.value()), default_out_dir=None)
         except Exception as e:
-            self._log("Create error: "+str(e)+"\n"+traceback.format_exc())
+            self._log("Create error: " + str(e) + "\n" + traceback.format_exc())
             QMessageBox.critical(self, "Create error", str(e))
 
     def create_rar(self):
         rarexe = shutil.which("rar") or shutil.which("rar.exe")
-        if not rarexe:
-            QMessageBox.critical(self, "No rar", "rar.exe not found"); return
-        items=[self.list_stage.item(i).text() for i in range(self.list_stage.count())]
-        if not items:
-            QMessageBox.information(self, "No files", "stage files"); return
+        if not rarexe: QMessageBox.critical(self, "No rar", "rar.exe not found"); return
+        items = [self.list_stage.item(i).text() for i in range(self.list_stage.count())]
+        if not items: QMessageBox.information(self, "No files", "stage files"); return
         out, _ = QFileDialog.getSaveFileName(self, "Save RAR as", filter="RAR (*.rar)")
         if not out: return
         if not out.lower().endswith(".rar"): out += ".rar"
@@ -890,21 +901,22 @@ class MiniArchWindow(QMainWindow):
         if pwd: cmd.append(f"-hp{pwd}")
         cmd.append(out); cmd += items
         rc, outb, errb = safe_run(cmd, timeout=600)
-        if rc==0:
-            self._log("RAR created: "+out)
-            QMessageBox.information(self, "RAR created", out)
+        if rc == 0:
+            self._log("RAR created: "+out); QMessageBox.information(self, "RAR created", out)
         else:
             QMessageBox.warning(self, "RAR create", f"rc={rc}")
 
-    # ---------- par2 UI ----------
+    # --- par2 UI functions ---
     def par2_add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Add files to par2 targets")
         for f in files: self.list_par2_targets.addItem(f)
         self._log(f"Added {len(files)} file targets")
 
     def par2_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Add folder to par2 targets (won't expand on add)")
-        if folder: self.list_par2_targets.addItem(folder); self._log("Added folder target: "+folder)
+        folder = QFileDialog.getExistingDirectory(self, "Add folder to par2 targets")
+        if folder:
+            self.list_par2_targets.addItem(folder)
+            self._log("Added folder target: "+folder)
 
     def par2_create_selected(self):
         sel = [self.list_par2_targets.item(i).text() for i in range(self.list_par2_targets.count()) if self.list_par2_targets.item(i).isSelected()]
@@ -935,19 +947,30 @@ class MiniArchWindow(QMainWindow):
             for t in targets:
                 if os.path.isdir(t):
                     files = self._expand_folder(t)
-                    if files: groups.append((files, Path(t).name, t))
+                    # filter out .par2 files
+                    files = [f for f in files if not f.lower().endswith(".par2")]
+                    if files:
+                        groups.append((files, Path(t).name, t))
                 else:
-                    groups.append(([t], None, None))
+                    if not Path(t).name.lower().endswith(".par2"):
+                        groups.append(([t], None, None))
         else:
+            # single combined par2 for all targets
             files=[]
             for t in targets:
-                if os.path.isdir(t): files += self._expand_folder(t)
-                else: files.append(t)
-            out_dir = QFileDialog.getExistingDirectory(self, "Where to write the .par2 file (directory)")
-            if not out_dir: QMessageBox.information(self, "Output required", "Choose an output directory"); return
+                if os.path.isdir(t): files += [f for f in self._expand_folder(t) if not f.lower().endswith(".par2")]
+                else:
+                    if not Path(t).name.lower().endswith(".par2"):
+                        files.append(t)
+            if not files:
+                QMessageBox.information(self, "No files", "No non-.par2 files found in targets"); return
+            out_dir = QFileDialog.getExistingDirectory(self, "Where to write the combined .par2 file")
+            if not out_dir:
+                QMessageBox.information(self, "Output required", "Choose an output directory"); return
             base_name, ok = QtWidgets.QInputDialog.getText(self, "Base name", "Enter base name for .par2 (no extension):", QtWidgets.QLineEdit.Normal, "archive_par2")
-            if not ok: base_name=None
-            groups.append((files, base_name or None, out_dir))
+            if not ok or not base_name:
+                QMessageBox.information(self, "Base required", "Provide base name"); return
+            groups.append((files, base_name, out_dir))
         mgr.signals.log.connect(lambda s: self._log("par2: "+s))
         mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
         mgr.signals.finished.connect(lambda summary: (self._log("par2 create finished"), self.progress.setValue(0)))
@@ -996,11 +1019,9 @@ class MiniArchWindow(QMainWindow):
                 found=[]
                 for root, _, files in os.walk(folder):
                     for fn in files:
-                        if fn.lower().endswith(".par2"):
-                            found.append(os.path.join(root, fn))
+                        if fn.lower().endswith(".par2"): found.append(os.path.join(root, fn))
                 if not found:
-                    QMessageBox.information(self, "No .par2", f"No .par2 files found under {folder}")
-                    return
+                    QMessageBox.information(self, "No .par2", "No .par2 files found"); return
                 self.list_loaded_par2.clear()
                 for f in found: self.list_loaded_par2.addItem(f)
                 self._log(f"Auto-loaded {len(found)} .par2 files from {folder}")
@@ -1019,32 +1040,23 @@ class MiniArchWindow(QMainWindow):
         mgr.signals.finished.connect(lambda summary: (self._log("par2 repair finished"), self.progress.setValue(0)))
         mgr.run_repair_many([self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())], move_repaired_to=dest if dest else None)
 
-    # ---------- par2 locate / search / install ----------
+    # --- search / locate / install par2 helpers ---
     def locate_par2(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Locate par2 executable", filter="Executables (*.exe);;All files (*)")
         if not fn: return
         try:
-            rc, out, err = safe_run([fn, "--version"], timeout=3)
+            rc,out,err = safe_run([fn,"--version"], timeout=3)
             if rc==0 or out or err:
                 CFG["par2_exe"]=fn; save_cfg(); self.par2mgr.par2_exe=fn; self.statusBar().showMessage("par2: "+fn); QMessageBox.information(self, "par2", "par2 configured"); return
         except Exception:
             pass
         QMessageBox.warning(self, "par2", "Selected file doesn't appear to be par2")
 
-    def search_par2(self):
-        found = self._search_common_par2_locations()
-        if found:
-            CFG["par2_exe"]=found; save_cfg(); self.par2mgr.par2_exe=found; self.statusBar().showMessage("par2: "+found); QMessageBox.information(self, "Found", f"par2 found: {found}")
-        else:
-            QMessageBox.information(self, "Not found", "No par2 found in common locations")
-
-    def _search_common_par2_locations(self):
+    def _search_common_par2(self):
         cand=[]
         if ON_WINDOWS:
             pf = os.getenv("PROGRAMFILES", r"C:\Program Files"); pf86 = os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
-            cand += [os.path.join(pf,"par2","par2.exe"), os.path.join(pf86,"par2","par2.exe"),
-                     os.path.join(pf,"par2cmdline","par2.exe"), os.path.join(pf86,"par2cmdline","par2.exe"),
-                     r"C:\ProgramData\chocolatey\lib\par2cmdline\tools\par2.exe"]
+            cand += [os.path.join(pf,"par2","par2.exe"), os.path.join(pf86,"par2","par2.exe"), r"C:\ProgramData\chocolatey\lib\par2cmdline\tools\par2.exe", r"C:\ProgramData\chocolatey\bin\par2.exe"]
             for p in os.environ.get("PATH","").split(os.pathsep):
                 cand.append(os.path.join(p,"par2.exe"))
         else:
@@ -1057,16 +1069,23 @@ class MiniArchWindow(QMainWindow):
                 if rc==0 or out or err: return c
         return None
 
+    def search_par2(self):
+        found = self._search_common_par2()
+        if found:
+            CFG["par2_exe"]=found; save_cfg(); self.par2mgr.par2_exe=found; self.statusBar().showMessage("par2: "+found); QMessageBox.information(self, "Found", f"par2 found: {found}")
+        else:
+            QMessageBox.information(self, "Not found", "No par2 found in common locations")
+
     def install_par2_choco(self):
         if not ON_WINDOWS or not shutil.which("choco"):
             QMessageBox.information(self, "Chocolatey missing", "Chocolatey not in PATH."); return
         resp = QMessageBox.question(self, "Install par2 via Chocolatey", "Install par2cmdline via Chocolatey? This requires admin.", QMessageBox.Yes | QMessageBox.No)
-        if resp!=QMessageBox.Yes: return
+        if resp != QMessageBox.Yes: return
         cmd = ["choco","install","par2cmdline","-y","--no-progress"]
         self._log("Running: " + " ".join(cmd))
         rc,out,err = safe_run(cmd, timeout=600)
         if rc==0:
-            found = self._search_common_par2_locations()
+            found = self._search_common_par2()
             if found:
                 CFG["par2_exe"]=found; save_cfg(); self.par2mgr.par2_exe=found; self.statusBar().showMessage("par2: "+found); QMessageBox.information(self, "Installed", "par2 installed and configured.")
             else:
@@ -1075,34 +1094,8 @@ class MiniArchWindow(QMainWindow):
             self._log("choco install rc=%s out=%s err=%s" % (rc, out[:200], err[:200]))
             QMessageBox.information(self, "Install failed", f"Install returned rc={rc}. See log")
 
-    # ---------- association helper ----------
-    def associate_jarc(self):
-        if not ON_WINDOWS or winreg is None:
-            QMessageBox.information(self, "Not supported", "Association helper only works on Windows.")
-            return
-        script_default = os.path.abspath(sys.argv[0])
-        script_path, _ = QFileDialog.getOpenFileName(self, "Select script or exe to associate .jarc with", script_default)
-        if not script_path: return
-        python_exec = sys.executable
-        cmd = f'"{python_exec}" "{script_path}" "%1"'
-        try:
-            base = r"Software\\Classes"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_WRITE) as hk:
-                with winreg.CreateKey(hk, ".jarc") as k:
-                    winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "MiniArch.jarc")
-                with winreg.CreateKey(hk, "MiniArch.jarc") as prog:
-                    winreg.SetValueEx(prog, "", 0, winreg.REG_SZ, "MiniArch JARC File")
-                    with winreg.CreateKey(prog, "DefaultIcon") as di:
-                        winreg.SetValueEx(di, "", 0, winreg.REG_SZ, "")
-                    with winreg.CreateKey(prog, r"shell\\open\\command") as cmdk:
-                        winreg.SetValueEx(cmdk, "", 0, winreg.REG_SZ, cmd)
-            QMessageBox.information(self, "Associated", ".jarc associated. You may need to use Open With to select default.")
-            self._log(".jarc associated to "+cmd)
-        except Exception as e:
-            self._log("Association failed: "+str(e)); QMessageBox.critical(self, "Assoc failed", str(e))
-
-    # ---------- cleanup ----------
-    def closeEvent(self, evt):
+    # --- misc ---
+    def closeEvent(self, ev):
         try:
             if self.thumb_worker and self.thumb_thread:
                 self.thumb_worker.stop(); self.thumb_thread.quit(); self.thumb_thread.wait(200)
@@ -1111,17 +1104,9 @@ class MiniArchWindow(QMainWindow):
         for d in self.temp_dirs:
             try: shutil.rmtree(str(d), ignore_errors=True)
             except Exception: pass
-        evt.accept()
+        ev.accept()
 
-# save cfg helper
-def save_cfg():
-    try:
-        CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CFG_FILE.write_text(json.dumps(CFG, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-# run
+# --- main ---
 def main():
     app = QApplication(sys.argv)
     w = MiniArchWindow()
