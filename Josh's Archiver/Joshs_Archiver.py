@@ -261,7 +261,7 @@ class Par2Manager:
     """
     Manages par2 create & repair. 
     run_create(groups, redundancy, default_out_dir=None) where groups is list of (files_list, base_name, out_dir)
-    run_repair_many(par2_files, move_repaired_to=None)
+    run_repair_many(par2_files, move_repaired_to=None, extract_repaired=True)
     """
 
     def __init__(self, par2_exe=None, timeout=900):
@@ -361,28 +361,77 @@ class Par2Manager:
         # else return the longest/first
         return par2_files[0] if par2_files else None
 
-    def _repair_single(self, main_par2, move_repaired_to=None):
-        res = {"par2": main_par2, "rc": None, "out":"", "err":"", "moved":[], "error": None}
+    def _try_extract_file(self, file_path: str, dest_folder: str):
+        """Attempt to extract archives (zip,7z,rar,jarc) to dest_folder.
+           Returns list of extracted paths (may be empty)."""
+        extracted = []
+        p = Path(file_path)
+        ext = p.suffix.lower()
+        dest = Path(dest_folder)
+        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            if ext == ".zip":
+                import zipfile
+                try:
+                    with zipfile.ZipFile(str(p), "r") as zf:
+                        zf.extractall(path=str(dest))
+                        extracted = [str(Path(dest)/nm) for nm in zf.namelist()]
+                except RuntimeError:
+                    # maybe password protected; skip extraction here
+                    self._log("zip extraction failed (maybe password).")
+            elif ext == ".7z" and HAS_PY7ZR:
+                try:
+                    with py7zr.SevenZipFile(str(p), 'r') as a:
+                        a.extractall(path=str(dest))
+                        for nm in a.getnames():
+                            extracted.append(str(Path(dest)/nm))
+                except Exception as e:
+                    self._log("7z extract failed: "+str(e))
+            elif ext == ".rar" and HAS_RARFILE:
+                try:
+                    with rarfile.RarFile(str(p)) as rf:
+                        rf.extractall(path=str(dest))
+                        for nm in rf.namelist():
+                            extracted.append(str(Path(dest)/nm))
+                except Exception as e:
+                    self._log("rar extract failed: "+str(e))
+            elif ext == ".jarc":
+                try:
+                    entries = read_jarc_manifest(str(p))
+                    for e in entries:
+                        data = extract_jarc_member_bytes(str(p), e["name"])
+                        outp = dest / Path(e["name"])
+                        outp.parent.mkdir(parents=True, exist_ok=True)
+                        outp.write_bytes(data)
+                        extracted.append(str(outp))
+                except Exception as e:
+                    self._log("jarc extract failed: "+str(e))
+        except Exception as e:
+            self._log("extract attempt error: "+str(e))
+        return extracted
+
+    def _repair_single(self, main_par2, move_repaired_to=None, extract_repaired=True):
+        res = {"par2": main_par2, "rc": None, "out":"", "err":"", "moved":[], "extracted":[], "error": None}
         try:
             p = Path(main_par2)
             if not p.exists():
                 res["error"] = "par2 missing"; return res
-            workdir = str(p.parent)
+            workdir = Path(p.parent)
             # snapshot existing file mtimes (excluding .par2 files)
             before = {}
-            for f in Path(workdir).iterdir():
+            for f in workdir.iterdir():
                 if f.is_file() and f.suffix.lower() != ".par2":
                     try: before[str(f)] = f.stat().st_mtime
                     except Exception: before[str(f)] = 0
             cmd = [self.par2_exe, "repair", str(p)]
             self._log("par2: Running repair: " + " ".join(cmd) + f" (cwd={workdir})")
-            rc, out, err = self._try_run(cmd, cwd=workdir)
+            rc, out, err = self._try_run(cmd, cwd=str(workdir))
             res["rc"] = rc; res["out"] = out; res["err"] = err
             # small wait; re-scan to find files with newer mtime
             time.sleep(0.2)
             moved = []
             changed_files = []
-            for f in Path(workdir).iterdir():
+            for f in workdir.iterdir():
                 if f.is_file() and f.suffix.lower() != ".par2":
                     old = before.get(str(f), 0)
                     try:
@@ -407,14 +456,36 @@ class Par2Manager:
                             moved.append(str(dest / Path(src).name))
                         except Exception as e:
                             self._log("Failed to move repaired file: " + str(e))
+            else:
+                # no move requested — keep changed files in place (but report them)
+                moved = []
             res["moved"] = moved
+
+            # Extraction step: for each changed file, if it's an archive, extract it
+            extracted_all = []
+            for cf in (moved if moved else changed_files):
+                # if we moved, extract from moved location; else from original location
+                src_path = Path(cf)
+                # choose extraction target: if moved->extract into same dest folder with subfolder; else into same folder
+                if move_repaired_to:
+                    extract_into = Path(move_repaired_to) / (src_path.stem + "_extracted")
+                else:
+                    extract_into = src_path.parent / (src_path.stem + "_extracted")
+                # check extension
+                ext = src_path.suffix.lower()
+                if ext in (".zip", ".7z", ".rar", ".jarc"):
+                    self._log(f"par2: extracting repaired archive {src_path} -> {extract_into}")
+                    extracted = self._try_extract_file(str(src_path), str(extract_into))
+                    extracted_all += extracted
+            res["extracted"] = extracted_all
+
             return res
         except Exception as e:
             res["error"] = str(e)
             self._log("par2 repair error: "+str(e)+"\n"+traceback.format_exc())
             return res
 
-    def run_repair_many(self, par2_files, move_repaired_to=None):
+    def run_repair_many(self, par2_files, move_repaired_to=None, extract_repaired=True):
         if self._thread and self._thread.is_alive():
             self._log("par2: repair already running")
             return
@@ -435,7 +506,7 @@ class Par2Manager:
                     self._log("par2: no main par2 found for group in " + dirpath)
                     continue
                 self._log(f"par2: Repairing {main} in {dirpath}")
-                r = self._repair_single(main, move_repaired_to=move_repaired_to)
+                r = self._repair_single(main, move_repaired_to=move_repaired_to, extract_repaired=extract_repaired)
                 r["group"] = files
                 summary.append(r)
             self.signals.finished.emit(summary)
@@ -448,7 +519,7 @@ class Par2Manager:
 class MiniArchWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MiniArch - fixed")
+        self.setWindowTitle("MiniArch - fixed (extract repaired)")
         self.resize(1100,780)
         self._install_icon()
         self._build_ui()
@@ -533,6 +604,10 @@ class MiniArchWindow(QMainWindow):
         self.btn_repair_selected = QtWidgets.QPushButton("Repair & Move Selected"); self.btn_repair_selected.clicked.connect(self.repair_selected); rrow.addWidget(self.btn_repair_selected)
         self.btn_repair_all = QtWidgets.QPushButton("Repair & Move All"); self.btn_repair_all.clicked.connect(self.repair_all); rrow.addWidget(self.btn_repair_all)
         self.btn_repair_selected.setEnabled(False); self.btn_repair_all.setEnabled(False)
+
+        # new checkbox: extract repaired archives automatically
+        self.chk_extract_after = QtWidgets.QCheckBox("Extract repaired archives"); self.chk_extract_after.setChecked(True)
+        right_l.addWidget(self.chk_extract_after)
 
         self.progress = QtWidgets.QProgressBar(); v.addWidget(self.progress)
 
@@ -992,6 +1067,7 @@ class MiniArchWindow(QMainWindow):
                 self.load_par2(); items = [self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count()) if self.list_loaded_par2.item(i).isSelected()]
             if not items: return
         dest = QFileDialog.getExistingDirectory(self, "Move repaired files to folder (optional)")
+        extract_flag = self.chk_extract_after.isChecked()
         mgr = Par2Manager(par2_exe=CFG.get("par2_exe"))
         if not mgr.is_ok():
             QMessageBox.information(self, "par2 missing", "par2 not configured."); return
@@ -999,15 +1075,21 @@ class MiniArchWindow(QMainWindow):
         mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
         def on_finished(summary):
             self._log("par2 repair finished"); self.progress.setValue(0)
-            moved=[]
+            moved=[]; extracted=[]
             for group in summary:
                 moved += group.get("moved", []) or []
+                extracted += group.get("extracted", []) or []
+            lines=[]
             if moved:
-                QMessageBox.information(self, "Repair done", "Moved repaired files:\n" + "\n".join(moved))
+                lines.append("Moved repaired files:\n" + "\n".join(moved))
+            if extracted:
+                lines.append("Extracted repaired archives:\n" + "\n".join(extracted))
+            if lines:
+                QMessageBox.information(self, "Repair done", "\n\n".join(lines))
             else:
                 QMessageBox.information(self, "Repair done", "Repair finished (see log).")
         mgr.signals.finished.connect(on_finished)
-        mgr.run_repair_many(items, move_repaired_to=dest if dest else None)
+        mgr.run_repair_many(items, move_repaired_to=dest if dest else None, extract_repaired=extract_flag)
 
     def repair_all(self):
         all_items = [self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())]
@@ -1032,13 +1114,14 @@ class MiniArchWindow(QMainWindow):
             else:
                 return
         dest = QFileDialog.getExistingDirectory(self, "Move repaired files to folder (optional)")
+        extract_flag = self.chk_extract_after.isChecked()
         mgr = Par2Manager(par2_exe=CFG.get("par2_exe"))
         if not mgr.is_ok():
             QMessageBox.information(self, "par2 missing", "par2 not configured."); return
         mgr.signals.log.connect(lambda s: self._log("par2: "+s))
         mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
         mgr.signals.finished.connect(lambda summary: (self._log("par2 repair finished"), self.progress.setValue(0)))
-        mgr.run_repair_many([self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())], move_repaired_to=dest if dest else None)
+        mgr.run_repair_many([self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())], move_repaired_to=dest if dest else None, extract_repaired=extract_flag)
 
     # --- search / locate / install par2 helpers ---
     def locate_par2(self):
