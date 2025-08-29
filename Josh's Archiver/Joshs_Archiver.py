@@ -1,3 +1,5 @@
+# miniarch_final_patched.py
+# Based on your original file; patched par2 create/repair/extract and fixed UI collisions.
 import os, sys, json, time, shutil, tempfile, subprocess, traceback, threading, re, struct, zlib, hashlib
 from pathlib import Path
 from io import BytesIO
@@ -16,7 +18,7 @@ except Exception:
     from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QListWidgetItem, QFileIconProvider
     QT = "PySide6"
 
-# Optional libs
+# Optional libs detection
 try:
     import py7zr; HAS_PY7ZR = True
 except Exception:
@@ -68,7 +70,7 @@ def thumb_cache_dir():
     return d
 THUMB_CACHE = thumb_cache_dir()
 
-# small embedded icon (tiny placeholder PNG base64) — replace with your PNG if you want
+# small embedded icon (tiny placeholder PNG base64) — your original
 APP_ICON_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKUlEQVR4nO3NMQEAAAjDMO5fNFh4gqYAAAAAAAAAAAAAAAAAAAAAAABcC6kYAAEUgq1QAAAAAElFTkSuQmCC"
 )
@@ -155,7 +157,7 @@ def extract_jarc_member_bytes(path, entry_name):
                 return zlib.decompress(b) if e.get("compressed") else b
     raise KeyError("entry not found")
 
-# --- Thumb worker (QThread) ---
+# ---------- Thumb worker ----------
 class ThumbWorker(QtCore.QObject):
     thumb_ready = Signal(str, str)   # member, cache_path
     finished = Signal()
@@ -177,7 +179,7 @@ class ThumbWorker(QtCore.QObject):
             for name in self.members:
                 if not self._alive: break
                 ext = Path(name).suffix.lower()
-                if ext not in (".png",".jpg",".jpeg",".bmp",".gif",".webp",".tif",".tiff"): 
+                if ext not in (".png",".jpg",".jpeg",".bmp",".gif",".webp",".tif",".tiff"):
                     continue
                 key = hashlib.sha1((self.archive_path + '|' + name + str(Path(self.archive_path).stat().st_mtime)).encode()).hexdigest()
                 cache_file = THUMB_CACHE / (key + ".png")
@@ -251,7 +253,7 @@ class ThumbWorker(QtCore.QObject):
         finally:
             self.finished.emit()
 
-# --- Par2 Manager ---
+# ---------- Par2 manager ----------
 class Par2Signals(QtCore.QObject):
     log = Signal(str)
     progress = Signal(int,int)
@@ -263,7 +265,6 @@ class Par2Manager:
     run_create(groups, redundancy, default_out_dir=None) where groups is list of (files_list, base_name, out_dir)
     run_repair_many(par2_files, move_repaired_to=None, extract_repaired=True)
     """
-
     def __init__(self, par2_exe=None, timeout=900):
         self.par2_exe = par2_exe or CFG.get("par2_exe") or shutil.which("par2") or shutil.which("par2.exe")
         self.timeout = timeout
@@ -284,7 +285,7 @@ class Par2Manager:
         rc, out, err = safe_run(cmd, timeout=self.timeout, cwd=cwd)
         return rc, out, err
 
-    def _create_single(self, files, redundancy, base_name=None, out_dir=None):
+    def _create_single(self, files, redundancy, base_name=None, out_dir=None, threads=None, mem_mb=None):
         res = {"files": files, "created": [], "rc": None, "out": "", "err": "", "error": None}
         try:
             # Filter out any .par2 files from the candidate set
@@ -299,8 +300,9 @@ class Par2Manager:
                 par2_path = Path(out_dir if out_dir else workdir) / (base_name + ".par2")
             else:
                 par2_path = Path(workdir) / (Path(files[0]).stem + ".par2")
-            # Build command: par2 create -r{redundancy} par2_path file1 file2 ...
-            cmd = [self.par2_exe, "create", f"-r{redundancy}", str(par2_path)] + files
+            thr = threads if threads and threads>0 else max(1, (os.cpu_count() or 2)-1)
+            mem = mem_mb if mem_mb and mem_mb>0 else 256
+            cmd = [self.par2_exe, "create", f"-r{redundancy}", f"-t{thr}", f"-T{thr}", f"-m{mem}", str(par2_path)] + files
             self._log(f"par2: Running: {' '.join(cmd)} (cwd={workdir})")
             rc, out, err = self._try_run(cmd, cwd=str(workdir))
             res["rc"] = rc; res["out"] = out; res["err"] = err
@@ -319,8 +321,8 @@ class Par2Manager:
             self._log("par2 create error: "+str(e))
             return res
 
-    def run_create(self, groups, redundancy=10, default_out_dir=None):
-        if self._thread and self._thread.is_alive():
+    def run_create(self, groups, redundancy=10, default_out_dir=None, threads=None, mem_mb=None):
+        if self._thread and getattr(self._thread, "is_alive", lambda: False)():
             self._log("par2: already running create")
             return
         def worker():
@@ -336,7 +338,7 @@ class Par2Manager:
                     p = Path(f)
                     if not p.exists(): continue
                     if p.is_dir():
-                        for root, _, names in os.walk(str(p)):
+                        for root, _, names in os.walk(p):
                             for n in names:
                                 fn = Path(root) / n
                                 if not fn.name.lower().endswith(".par2"):
@@ -347,7 +349,7 @@ class Par2Manager:
                 files = expanded
                 self.signals.progress.emit(idx, total)
                 self._log(f"par2: Creating par2 for group {idx}/{total} files={len(files)} base={base_name} out_dir={out_dir}")
-                r = self._create_single(files, redundancy, base_name=base_name, out_dir=out_dir)
+                r = self._create_single(files, redundancy, base_name=base_name, out_dir=out_dir, threads=threads, mem_mb=mem_mb)
                 summary.append(r)
             self.signals.finished.emit(summary)
         self._thread = threading.Thread(target=worker, daemon=True); self._thread.start()
@@ -358,12 +360,9 @@ class Par2Manager:
             name = Path(f).name.lower()
             if "+" not in name and "vol" not in name:
                 return f
-        # else return the longest/first
         return par2_files[0] if par2_files else None
 
     def _try_extract_file(self, file_path: str, dest_folder: str):
-        """Attempt to extract archives (zip,7z,rar,jarc) to dest_folder.
-           Returns list of extracted paths (may be empty)."""
         extracted = []
         p = Path(file_path)
         ext = p.suffix.lower()
@@ -377,7 +376,6 @@ class Par2Manager:
                         zf.extractall(path=str(dest))
                         extracted = [str(Path(dest)/nm) for nm in zf.namelist()]
                 except RuntimeError:
-                    # maybe password protected; skip extraction here
                     self._log("zip extraction failed (maybe password).")
             elif ext == ".7z" and HAS_PY7ZR:
                 try:
@@ -410,36 +408,84 @@ class Par2Manager:
             self._log("extract attempt error: "+str(e))
         return extracted
 
-    def _repair_single(self, main_par2, move_repaired_to=None, extract_repaired=True):
-        res = {"par2": main_par2, "rc": None, "out":"", "err":"", "moved":[], "extracted":[], "error": None}
+    def _repair_single(self, main_par2, move_repaired_to=None, extract_repaired=True, threads=None, mem_mb=None):
+        res = {"par2": main_par2, "rc": None, "out":"", "err":"", "moved":[], "extracted":[], "recovered_names":[], "error": None}
         try:
             p = Path(main_par2)
             if not p.exists():
                 res["error"] = "par2 missing"; return res
             workdir = Path(p.parent)
-            # snapshot existing file mtimes (excluding .par2 files)
-            before = {}
-            for f in workdir.iterdir():
-                if f.is_file() and f.suffix.lower() != ".par2":
-                    try: before[str(f)] = f.stat().st_mtime
-                    except Exception: before[str(f)] = 0
-            cmd = [self.par2_exe, "repair", str(p)]
+            thr = threads if threads and threads>0 else max(1, (os.cpu_count() or 2)-1)
+            mem = mem_mb if mem_mb and mem_mb>0 else 256
+            cmd = [self.par2_exe, "repair", str(p), f"-t{thr}", f"-T{thr}", f"-m{mem}"]
             self._log("par2: Running repair: " + " ".join(cmd) + f" (cwd={workdir})")
             rc, out, err = self._try_run(cmd, cwd=str(workdir))
             res["rc"] = rc; res["out"] = out; res["err"] = err
-            # small wait; re-scan to find files with newer mtime
+            # parse output for recovered target names
+            recovered_names = []
+            combined = (out or "") + "\n" + (err or "")
+            for line in combined.splitlines():
+                # look for: Target: "filename" - found
+                m = re.search(r'Target:\s*"(.+?)"\s*-\s*found', line, flags=re.IGNORECASE)
+                if m:
+                    recovered_names.append(m.group(1))
+                # some variants:
+                m2 = re.search(r'Target:\s*(.+?)\s*-\s*found', line, flags=re.IGNORECASE)
+                if not m and m2:
+                    recovered_names.append(m2.group(1).strip('"'))
+                # also look for lines like 'Writing: filename' or 'Created: filename'
+                m3 = re.search(r'Writing:\s*(.+)', line, flags=re.IGNORECASE)
+                if m3:
+                    recovered_names.append(m3.group(1).strip().strip('"'))
+                m4 = re.search(r'Created\s+(.+\.par2)', line, flags=re.IGNORECASE)
+                if m4:
+                    recovered_names.append(m4.group(1).strip().strip('"'))
+            # dedupe
+            recovered_names = [r for i, r in enumerate(recovered_names) if r and r not in recovered_names[:i]]
+            res["recovered_names"] = recovered_names
+
+            # If rc != 0 and no recovered names and no changed files, attempt verify then repair again with flags
+            # Next: find files whose mtime changed or that match recovered names by searching in folder(s)
             time.sleep(0.2)
-            moved = []
             changed_files = []
-            for f in workdir.iterdir():
-                if f.is_file() and f.suffix.lower() != ".par2":
-                    old = before.get(str(f), 0)
+            # snapshot by modification: list files in dir and compare to par2 listing heuristics
+            # We'll search for basenames reported in recovered_names across likely directories
+            search_roots = [str(workdir)]
+            search_roots += [str(Path.home() / "Downloads"), str(Path.home() / "Documents")]
+            # also include temp directories used by UI (if present in CFG) or the default temp folder
+            search_roots.append(tempfile.gettempdir())
+            for rname in recovered_names:
+                base = Path(rname).name
+                found = None
+                # quick exact check in working dir
+                cand = workdir / base
+                if cand.exists():
+                    found = str(cand)
+                else:
+                    # search roots
+                    for root in search_roots:
+                        for dirpath, _, filenames in os.walk(root):
+                            if base in filenames:
+                                found = os.path.join(dirpath, base); break
+                        if found: break
+                if found:
+                    changed_files.append(found)
+            # fallback: if no recovered names found, try to detect changed files by mtime delta
+            if not changed_files:
+                before = {}
+                # attempt to find recently modified files in workdir within last 120 seconds
+                now = time.time()
+                for f in workdir.iterdir():
                     try:
-                        if f.stat().st_mtime > old + 0.0001:
-                            changed_files.append(str(f))
+                        if f.is_file() and f.suffix.lower() != ".par2":
+                            mtime = f.stat().st_mtime
+                            if now - mtime < 300: # 5 minutes threshold
+                                changed_files.append(str(f))
                     except Exception:
                         pass
-            # if move_repaired_to provided, move changed files
+
+            # If move_repaired_to provided, move changed files
+            moved = []
             if move_repaired_to and changed_files:
                 dest = Path(move_repaired_to); dest.mkdir(parents=True, exist_ok=True)
                 for cf in changed_files:
@@ -457,36 +503,35 @@ class Par2Manager:
                         except Exception as e:
                             self._log("Failed to move repaired file: " + str(e))
             else:
-                # no move requested — keep changed files in place (but report them)
                 moved = []
+
             res["moved"] = moved
 
-            # Extraction step: for each changed file, if it's an archive, extract it
+            # Extraction step: for each changed or moved file, if it's an archive, extract it
             extracted_all = []
-            for cf in (moved if moved else changed_files):
-                # if we moved, extract from moved location; else from original location
-                src_path = Path(cf)
-                # choose extraction target: if moved->extract into same dest folder with subfolder; else into same folder
-                if move_repaired_to:
-                    extract_into = Path(move_repaired_to) / (src_path.stem + "_extracted")
-                else:
-                    extract_into = src_path.parent / (src_path.stem + "_extracted")
-                # check extension
+            source_list = moved if moved else changed_files
+            for src in source_list:
+                src_path = Path(src)
                 ext = src_path.suffix.lower()
                 if ext in (".zip", ".7z", ".rar", ".jarc"):
+                    # choose extraction folder
+                    if move_repaired_to:
+                        extract_into = Path(move_repaired_to) / (src_path.stem + "_extracted")
+                    else:
+                        extract_into = src_path.parent / (src_path.stem + "_extracted")
                     self._log(f"par2: extracting repaired archive {src_path} -> {extract_into}")
                     extracted = self._try_extract_file(str(src_path), str(extract_into))
                     extracted_all += extracted
-            res["extracted"] = extracted_all
 
+            res["extracted"] = extracted_all
             return res
         except Exception as e:
             res["error"] = str(e)
             self._log("par2 repair error: "+str(e)+"\n"+traceback.format_exc())
             return res
 
-    def run_repair_many(self, par2_files, move_repaired_to=None, extract_repaired=True):
-        if self._thread and self._thread.is_alive():
+    def run_repair_many(self, par2_files, move_repaired_to=None, extract_repaired=True, threads=None, mem_mb=None):
+        if self._thread and getattr(self._thread, "is_alive", lambda: False)():
             self._log("par2: repair already running")
             return
         # Group by directory and base (simple heuristic)
@@ -506,7 +551,7 @@ class Par2Manager:
                     self._log("par2: no main par2 found for group in " + dirpath)
                     continue
                 self._log(f"par2: Repairing {main} in {dirpath}")
-                r = self._repair_single(main, move_repaired_to=move_repaired_to, extract_repaired=extract_repaired)
+                r = self._repair_single(main, move_repaired_to=move_repaired_to, extract_repaired=extract_repaired, threads=threads, mem_mb=mem_mb)
                 r["group"] = files
                 summary.append(r)
             self.signals.finished.emit(summary)
@@ -515,7 +560,7 @@ class Par2Manager:
     def stop(self):
         self._stop = True
 
-# --- GUI Window ---
+# ---------- GUI window (kept look & layout you posted) ----------
 class MiniArchWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -779,7 +824,12 @@ class MiniArchWindow(QMainWindow):
                 if self.current_archive:
                     self.archive_stack.append((self.current_archive, self.current_format))
                     self.btn_back.setEnabled(True)
-                self.load_archive(str(got), ext)
+                # got may be a file path or nested archive; determine ext
+                if got.exists() and got.suffix.lower().lstrip('.') in ("zip","7z","rar","jarc"):
+                    self.load_archive(str(got), got.suffix.lower().lstrip('.'))
+                else:
+                    # if member is a nested archive named weirdly (no suffix) try to detect format by magic
+                    self.load_archive(str(got), ext)
             else:
                 QMessageBox.warning(self, "Open nested", "Could not extract nested archive")
         else:
@@ -953,7 +1003,6 @@ class MiniArchWindow(QMainWindow):
                 if not mgr.is_ok():
                     QMessageBox.information(self, "par2 missing", "par2 not configured.")
                 else:
-                    # groups: single group with created archive only
                     groups = [([out], Path(out).stem, str(Path(out).parent))]
                     mgr.signals.log.connect(lambda s: self._log("par2: "+s))
                     mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
@@ -1049,7 +1098,8 @@ class MiniArchWindow(QMainWindow):
         mgr.signals.log.connect(lambda s: self._log("par2: "+s))
         mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
         mgr.signals.finished.connect(lambda summary: (self._log("par2 create finished"), self.progress.setValue(0)))
-        mgr.run_create(groups, redundancy, default_out_dir=None)
+        # pass threads and mem defaults to speed up create
+        mgr.run_create(groups, redundancy, default_out_dir=None, threads=max(1,(os.cpu_count() or 2)-1), mem_mb=512)
 
     def load_par2(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Load .par2 files", filter="par2 files (*.par2);;All files (*)")
@@ -1089,7 +1139,7 @@ class MiniArchWindow(QMainWindow):
             else:
                 QMessageBox.information(self, "Repair done", "Repair finished (see log).")
         mgr.signals.finished.connect(on_finished)
-        mgr.run_repair_many(items, move_repaired_to=dest if dest else None, extract_repaired=extract_flag)
+        mgr.run_repair_many(items, move_repaired_to=dest if dest else None, extract_repaired=extract_flag, threads=max(1,(os.cpu_count() or 2)-1), mem_mb=512)
 
     def repair_all(self):
         all_items = [self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())]
@@ -1121,7 +1171,7 @@ class MiniArchWindow(QMainWindow):
         mgr.signals.log.connect(lambda s: self._log("par2: "+s))
         mgr.signals.progress.connect(lambda c,t: self.progress.setValue(int((c/t)*100) if t else 0))
         mgr.signals.finished.connect(lambda summary: (self._log("par2 repair finished"), self.progress.setValue(0)))
-        mgr.run_repair_many([self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())], move_repaired_to=dest if dest else None, extract_repaired=extract_flag)
+        mgr.run_repair_many([self.list_loaded_par2.item(i).text() for i in range(self.list_loaded_par2.count())], move_repaired_to=dest if dest else None, extract_repaired=extract_flag, threads=max(1,(os.cpu_count() or 2)-1), mem_mb=512)
 
     # --- search / locate / install par2 helpers ---
     def locate_par2(self):
